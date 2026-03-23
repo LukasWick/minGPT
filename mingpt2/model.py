@@ -26,6 +26,7 @@ class NewGELU(nn.Module):
     def forward(self, x):
         return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
 
+
 class CausalSelfAttention(nn.Module):
     """
     A vanilla multi-head masked self-attention layer with a projection at the end.
@@ -49,20 +50,28 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
-    def forward(self, x):
+    def calculate_attention_matrix(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
+
+        return att
+    
+    def forward(self, x, att):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k , v  = self.c_attn(x).split(self.n_embd, dim=2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
         y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
@@ -70,59 +79,87 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
-class CausalMultiStepSelfAttention(nn.Module):
-    """
-    A multistep multi-head masked self-attention layer with a projection at the end.
-    It is possible to use torch.nn.MultiheadAttention here but I am including an
-    explicit implementation here to show that there is nothing too scary here.
-    """
+    # def forward(self, x):
+    #     B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+    #     # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+    #     q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
+    #     k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+    #     q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+    #     v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        self.c_steps = nn.Linear(config.n_embd, config.n_steps)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        # regularization
-        self.attn_dropout = nn.Dropout(config.attn_pdrop)
-        self.resid_dropout = nn.Dropout(config.resid_pdrop)
-        # causal mask to ensure that attention is only applied to the left in the input sequence
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                     .view(1, 1, config.block_size, config.block_size))
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
+    #     # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+    #     att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+    #     att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+    #     att = F.softmax(att, dim=-1)
+    #     att = self.attn_dropout(att)
+    #     y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+    #     y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
-    def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+    #     # output projection
+    #     y = self.resid_dropout(self.c_proj(y))
+    #     return y
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+# class CausalMultiStepSelfAttention(nn.Module):
+#     """
+#     A multistep multi-head masked self-attention layer with a projection at the end.
+#     It is possible to use torch.nn.MultiheadAttention here but I am including an
+#     explicit implementation here to show that there is nothing too scary here.
+#     """
 
-        s = self.c_steps(x).unsqueeze(1)  # (B, 1, T, n_steps)
+#     def __init__(self, config):
+#         super().__init__()
+#         assert config.n_embd % config.n_head == 0
+#         # key, query, value projections for all heads, but in a batch
+#         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+#         self.steps = config.n_steps if hasattr(config, 'n_steps') else 1
+#         self.act = NewGELU()       
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+#         self.c_steps = nn.Linear(config.n_embd, config.n_steps)
+#         # output projection
+#         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+#         # regularization
+#         self.attn_dropout = nn.Dropout(config.attn_pdrop)
+#         self.resid_dropout = nn.Dropout(config.resid_pdrop)
+#         # causal mask to ensure that attention is only applied to the left in the input sequence
+#         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+#                                      .view(1, 1, config.block_size, config.block_size))
+#         self.n_head = config.n_head
+#         self.n_embd = config.n_embd
 
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
-        return y
+#     def forward(self, x):
+#         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+
+#         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+#         q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
+#         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+#         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+#         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+#         s = self.c_steps(x).unsqueeze(1)  # (B, 1, T, n_steps)
+
+#         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+#         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+#         att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+#         att = F.softmax(att, dim=-1)
+#         att = self.attn_dropout(att)
+#         y = v
+#         for _ in range(self.steps):
+#             y = att @ y # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+#             y = self.act(y)
+            
+#         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+#         # output projection
+#         y = self.resid_dropout(self.c_proj(y))
+#         return y
 
 class Block(nn.Module):
     """ an unassuming Transformer block """
 
     def __init__(self, config):
         super().__init__()
+        self.steps = config.n_steps if hasattr(config, 'n_steps') else 1
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
@@ -134,10 +171,28 @@ class Block(nn.Module):
         ))
         m = self.mlp
         self.mlpf = lambda x: m.dropout(m.c_proj(m.act(m.c_fc(x)))) # MLP forward
+        self.stable_mlP = config.stable_mlP if hasattr(config, 'stable_mlP') else False 
+        if self.stable_mlP: 
+            self.mlp_2 = nn.ModuleDict(dict(
+                c    = nn.Linear(config.n_embd*self.steps, config.n_embd),
+                act     = NewGELU(),
+                dropout = nn.Dropout(config.resid_pdrop),
+            ))
+            
+            m2 = self.mlp_2
+            self.mlpf_2 = lambda x: m2.dropout(m2.act(m2.c(x))) # MLP forward
+        
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlpf(self.ln_2(x))
+    def forward(self, x): 
+        att = self.attn.calculate_attention_matrix(self.ln_1(x))
+        X = []
+        for _ in range(self.steps):
+            x = x + self.attn(self.ln_1(x),att)
+            x = x + self.mlpf(self.ln_2(x))
+            X.append(x)
+        if not self.stable_mlP:
+            return x
+        x = self.mlpf_2(torch.cat(X, dim=-1))
         return x
 
 class GPT(nn.Module):
@@ -158,6 +213,7 @@ class GPT(nn.Module):
         C.embd_pdrop = 0.1
         C.resid_pdrop = 0.1
         C.attn_pdrop = 0.1
+        C.n_steps = 1 # number of steps for multi-step attention
         return C
 
     def __init__(self, config):

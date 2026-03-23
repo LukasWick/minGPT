@@ -13,9 +13,9 @@ import pandas as pd
 from torch.utils.data import Dataset
 from torch.utils.data.dataloader import DataLoader
 
-from mingpt.model import GPT
-from mingpt.trainer import Trainer
-from mingpt.utils import set_seed, setup_logging, CfgNode as CN
+from mingpt2.model import GPT
+from mingpt2.trainer import Trainer
+from mingpt2.utils import set_seed, setup_logging, CfgNode as CN
 from datetime import datetime
 
 # -----------------------------------------------------------------------------
@@ -39,7 +39,8 @@ def get_config():
     # trainer
     C.trainer = Trainer.get_default_config()
     C.trainer.learning_rate = 5e-4 # the model we're using is so small that we can go a bit faster
-
+    C.model.n_steps = 3 # we will use multi-step attention to help the model learn the multiplication algorithm, since it needs to "carry" digits across multiple steps
+    C.model.stable_mlP = True
     return C
 
 # -----------------------------------------------------------------------------

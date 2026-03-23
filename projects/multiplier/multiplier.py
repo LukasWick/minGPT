@@ -11,9 +11,9 @@ import pandas as pd
 from torch.utils.data import Dataset
 from torch.utils.data.dataloader import DataLoader
 
-from mingpt.model import GPT
-from mingpt.trainer import Trainer
-from mingpt.utils import set_seed, setup_logging, CfgNode as CN
+from mingpt2.model import GPT
+from mingpt2.trainer import Trainer
+from mingpt2.utils import set_seed, setup_logging, CfgNode as CN
 from datetime import datetime
 
 # -----------------------------------------------------------------------------
@@ -24,12 +24,13 @@ def get_config():
 
     # system
     C.system = CN()
-    C.system.seed = 3407
+    C.system.seed = 3408
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     C.system.work_dir = f'./out/multiplier/{timestamp}/'
 
     # data
     C.data = MultiplicationDataset.get_default_config()
+    C.data.ndigit = 2
 
     # model
     C.model = GPT.get_default_config()
@@ -39,6 +40,10 @@ def get_config():
     C.trainer = Trainer.get_default_config()
     C.trainer.learning_rate = 5e-4 # the model we're using is so small that we can go a bit faster
 
+    C.trainer.max_iters = 50001
+
+    C.model.n_steps = 3 # we will use multi-step attention to help the model learn the multiplication algorithm, since it needs to "carry" digits across multiple steps
+    C.model.stable_mlP = True
     return C
 
 # -----------------------------------------------------------------------------
@@ -149,7 +154,6 @@ if __name__ == '__main__':
     # construct the model
     config.model.vocab_size = train_dataset.get_vocab_size()
     config.model.block_size = train_dataset.get_block_size()
-    config.trainer.max_iters = 9001 if config.data.ndigit <=2 else 6001
 
     model = GPT(config.model)
 
