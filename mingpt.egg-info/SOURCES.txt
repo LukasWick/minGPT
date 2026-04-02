@@ -17,4 +17,9 @@ mingpt2/bpe.py
 mingpt2/model.py
 mingpt2/trainer.py
 mingpt2/utils.py
+mingpt_memory/__init__.py
+mingpt_memory/bpe.py
+mingpt_memory/model.py
+mingpt_memory/trainer.py
+mingpt_memory/utils.py
 tests/test_huggingface_import.py
