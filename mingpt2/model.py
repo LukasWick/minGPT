@@ -65,6 +65,21 @@ class CausalSelfAttention(nn.Module):
 
         return att
     
+    # def calculate_time_attention_matrix(self, x):
+    #     B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+
+    #     # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+    #     ta  = self.c_attn(x)
+    #     # k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+    #     # q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+    #     # # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+    #     # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+    #     # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+    #     # att = F.softmax(att, dim=-1)
+    #     # att = self.attn_dropout(att)
+
+    #     return ta
+    
     def forward(self, x, att):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
@@ -172,27 +187,44 @@ class Block(nn.Module):
         m = self.mlp
         self.mlpf = lambda x: m.dropout(m.c_proj(m.act(m.c_fc(x)))) # MLP forward
         self.stable_mlP = config.stable_mlP if hasattr(config, 'stable_mlP') else False 
+        self.use_time_mlp = config.use_time_mlp if hasattr(config, 'use_time_mlp') else False
+        
         if self.stable_mlP: 
             self.mlp_2 = nn.ModuleDict(dict(
-                c    = nn.Linear(config.n_embd*self.steps, config.n_embd),
+                c    = nn.Linear(config.n_embd*(self.steps+1), config.n_embd),
                 act     = NewGELU(),
                 dropout = nn.Dropout(config.resid_pdrop),
             ))
             
             m2 = self.mlp_2
             self.mlpf_2 = lambda x: m2.dropout(m2.act(m2.c(x))) # MLP forward
-        
+        elif self.use_time_mlp:
+            self.c_time_mlp = nn.Linear(config.n_embd, (self.steps+1)) # for calculating attention weights based on time step
+
+            # self.mlp_2 = nn.ModuleDict(dict(
+            #     c    = nn.Linear(config.n_embd*self.steps, config.n_embd),
+            #     act     = NewGELU(),
+            #     dropout = nn.Dropout(config.resid_pdrop),
+            # ))
+            # m2 = self.mlp_2
+            # self.mlpf_2 = lambda x: m2.dropout(m2.act(m2.c(x))) # MLP forward
 
     def forward(self, x): 
         att = self.attn.calculate_attention_matrix(self.ln_1(x))
-        X = []
+        X = [x]
         for _ in range(self.steps):
             x = x + self.attn(self.ln_1(x),att)
             x = x + self.mlpf(self.ln_2(x))
             X.append(x)
-        if not self.stable_mlP:
+        if self.stable_mlP:
+            x = x + self.mlpf_2(torch.cat(X, dim=-1))/self.steps**0.5 # simple scaling to help with stability, since we are concatenating the outputs of multiple steps
             return x
-        x = self.mlpf_2(torch.cat(X, dim=-1))
+        if self.use_time_mlp:
+            time_weights = self.c_time_mlp(X[0]) # (B, T, (steps+1))
+            X = torch.stack(X, dim=-1) # (B, T, n_embd,(steps+1))
+            X = X / self.steps**0.5 # simple scaling to help with stability, since we are concatenating the outputs of multiple steps
+            x = (X@ time_weights.unsqueeze(-1)).squeeze(-1) # (B, T, n_embd)
+            return x
         return x
 
 class GPT(nn.Module):
@@ -243,6 +275,7 @@ class GPT(nn.Module):
                 'gpt-mini':     dict(n_layer=6, n_head=6, n_embd=192),
                 'gpt-micro':    dict(n_layer=4, n_head=4, n_embd=128),
                 'gpt-nano':     dict(n_layer=3, n_head=3, n_embd=48),
+                'gpt-pico':     dict(n_layer=2, n_head=2, n_embd=16),
             }[config.model_type])
 
         self.transformer = nn.ModuleDict(dict(
@@ -282,7 +315,7 @@ class GPT(nn.Module):
         from a huggingface/transformers checkpoint.
         """
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        from transformers import GPT2LMHeadModel
+        from transformers import GPTLMHeadModel
 
         # create a from-scratch initialized minGPT model
         config = cls.get_default_config()
@@ -293,7 +326,7 @@ class GPT(nn.Module):
         sd = model.state_dict()
 
         # init a huggingface/transformers model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        model_hf = GPTLMHeadModel.from_pretrained(model_type)
         sd_hf = model_hf.state_dict()
 
         # copy while ensuring all of the parameters are aligned and match in names and shapes

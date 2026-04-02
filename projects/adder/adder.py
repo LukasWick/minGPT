@@ -34,13 +34,16 @@ def get_config():
     C.system.work_dir = f'./out/adder/{timestamp}/'
     # model
     C.model = GPT.get_default_config()
-    C.model.model_type = 'gpt-nano'
+    C.model.model_type = 'gpt-pico'
 
     # trainer
     C.trainer = Trainer.get_default_config()
     C.trainer.learning_rate = 5e-4 # the model we're using is so small that we can go a bit faster
-    C.model.n_steps = 3 # we will use multi-step attention to help the model learn the multiplication algorithm, since it needs to "carry" digits across multiple steps
-    C.model.stable_mlP = True
+    C.model.n_steps = 1 # we will use multi-step attention to help the model learn the multiplication algorithm, since it needs to "carry" digits across multiple steps
+    C.model.stable_mlP = False
+    C.model.use_time_mlp = False
+    C.trainer.max_iters = 150001
+
     return C
 
 # -----------------------------------------------------------------------------
@@ -161,7 +164,6 @@ if __name__ == '__main__':
     # construct the model
     config.model.vocab_size = train_dataset.get_vocab_size()
     config.model.block_size = train_dataset.get_block_size()
-    config.trainer.max_iters = 100001 if config.data.ndigit <=2 else 6001
     model = GPT(config.model)
 
     # construct the trainer object
