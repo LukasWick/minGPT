@@ -1,3 +1,4 @@
 mingpt
 mingpt2
+mingpt_distance_embedding
 mingpt_memory

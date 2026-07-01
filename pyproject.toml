@@ -17,4 +17,4 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["mingpt*", "mingpt*.*"]
+include = ["mingpt*", "mingpt*.*","mingpt_distance_embedding*", "mingpt_distance_embedding*.*"]

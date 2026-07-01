@@ -2,16 +2,23 @@
 Trains a character-level language model.
 """
 
+from datetime import datetime
 import os
 import sys
 
+import pandas as pd
 import torch
 from torch.utils.data import Dataset
 from torch.utils.data.dataloader import DataLoader
 
-from mingpt.model import GPT
-from mingpt.trainer import Trainer
-from mingpt.utils import set_seed, setup_logging, CfgNode as CN
+from mingpt_memory.model import GPT
+from mingpt_memory.trainer import Trainer
+from mingpt_memory.utils import set_seed, setup_logging, CfgNode as CN
+
+# from mingpt_distance_embedding.model import GPT
+# from mingpt_distance_embedding.trainer import Trainer
+# from mingpt_distance_embedding.utils import set_seed, setup_logging, CfgNode as CN
+
 
 # -----------------------------------------------------------------------------
 
@@ -22,19 +29,23 @@ def get_config():
     # system
     C.system = CN()
     C.system.seed = 3407
-    C.system.work_dir = './out/chargpt'
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    C.system.work_dir = f'./out/chargpt/{timestamp}/'
 
     # data
     C.data = CharDataset.get_default_config()
+    C.data.block_size = 64
 
     # model
     C.model = GPT.get_default_config()
     C.model.model_type = 'gpt-nano'
-
+    # C.model.n_knowledge_context = 0
+    
     # trainer
     C.trainer = Trainer.get_default_config()
-    C.trainer.learning_rate = 5e-4 # the model we're using is so small that we can go a bit faster
-
+    C.trainer.learning_rate = 1e-4 # the model we're using is so small that we can go a bit faster
+    
+    # C.model_architecture = "attpos"
     return C
 
 # -----------------------------------------------------------------------------
@@ -103,7 +114,8 @@ if __name__ == '__main__':
 
     # construct the trainer object
     trainer = Trainer(config.trainer, model, train_dataset)
-
+    train_loss = []
+    epochs = []
     # iteration callback
     def batch_end_callback(trainer):
 
@@ -112,12 +124,15 @@ if __name__ == '__main__':
 
         if trainer.iter_num % 500 == 0:
             # evaluate both the train and test score
+            train_loss.append(trainer.loss.item())
+            epochs.append(trainer.iter_num)
+
             model.eval()
             with torch.no_grad():
                 # sample from the model...
                 context = "O God, O God!"
                 x = torch.tensor([train_dataset.stoi[s] for s in context], dtype=torch.long)[None,...].to(trainer.device)
-                y = model.generate(x, 500, temperature=1.0, do_sample=True, top_k=10)[0]
+                y = model.generate(x, 400, temperature=1.0, do_sample=True, top_k=10)[0]
                 completion = ''.join([train_dataset.itos[int(i)] for i in y])
                 print(completion)
             # save the latest model
@@ -126,6 +141,15 @@ if __name__ == '__main__':
             torch.save(model.state_dict(), ckpt_path)
             # revert model to training mode
             model.train()
+        
+        if trainer.iter_num % 1000 == 0:
+            scores_df = pd.DataFrame({
+                'train_loss': train_loss,
+                'epoch': epochs
+            })
+            scores_csv_path = os.path.join(config.system.work_dir, "train_scores.csv")
+            scores_df.to_csv(scores_csv_path, index=False)
+
 
     trainer.set_callback('on_batch_end', batch_end_callback)
 

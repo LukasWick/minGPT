@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-from mingpt_memory.utils import CfgNode as CN
+from mingpt_distance_embedding.utils import CfgNode as CN
 
 # -----------------------------------------------------------------------------
 
@@ -35,58 +35,83 @@ class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.n_kc = config.n_knowledge_context if hasattr(config, 'n_knowledge_context') else 0
-
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn_q = nn.Linear(config.n_embd, config.n_embd)
-        self.c_attn_kv = nn.Linear(config.n_embd, 2 * config.n_embd)
-
-        # learnable memory tokens for knowledge context
-        if self.n_kc > 0:
-            self.memory_tokens = nn.Parameter(0.02 * torch.randn(1, self.n_kc, config.n_embd))
-
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+
+        # attention mlp: we concatenate 4 extra handcrafted heads (3 in `pos`, 1 in `pos2`)
+        n_att = config.n_head + 4
+
+        self.mlp_att = nn.ModuleDict(dict(
+            c_fc    = nn.Linear(n_att, 4 * n_att),
+            c_proj  = nn.Linear(4 * n_att, config.n_head),
+            act     = NewGELU(),
+        ))
+        ma = self.mlp_att
+        self.mlp_attf = lambda x: ma.c_proj(ma.act(ma.c_fc(x)))
+
         # regularization
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
-        # causal mask extended for memory tokens: queries always attend to memory,
-        # but still only attend to current and past input positions
-        causal_mask = torch.tril(torch.ones(config.block_size, config.block_size))
-        memory_mask = torch.ones(config.block_size, self.n_kc)
-        full_mask = torch.cat([memory_mask, causal_mask], dim=1)
-        self.register_buffer("bias", full_mask.view(1, 1, config.block_size, config.block_size + self.n_kc))
+        # causal mask to ensure that attention is only applied to the left in the input sequence
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                     .view(1, 1, config.block_size, config.block_size))
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+
+        # precompute handcrafted positional heads (causal: lower-triangular)
+        bs = config.block_size
+        causal = torch.tril(torch.ones(bs, bs))
+        idx = torch.arange(bs)
+        # head 1: main diagonal
+        pos_main = torch.zeros(bs, bs)
+        pos_main[idx, idx] = 1.0
+        # head 2: lower off-diagonal (token attends to previous token)
+        pos_down = torch.zeros(bs, bs)
+        if bs > 1:
+            pos_down[idx[1:], idx[:-1]] = 1.0
+        # head 3: distance-2 lower diagonal (token attends to 2 positions back)
+        pos_down2 = torch.zeros(bs, bs)
+        if bs > 2:
+            pos_down2[idx[2:], idx[:-2]] = 1.0
+        # head 4: 1/distance, masked to causal
+        dist = (idx.unsqueeze(1) - idx.unsqueeze(0)).abs().float()
+        inv_dist = torch.where(dist == 0, torch.ones_like(dist), 1.0 / dist)
+        inv_dist = inv_dist * causal  # zero out future positions
+        # stack all 4 and register as buffer: (1, 4, bs, bs)
+        pos_heads = torch.stack([pos_main, pos_down, pos_down2, inv_dist], dim=0).unsqueeze(0)
+        self.register_buffer("pos_heads", pos_heads)
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
-        # calculate query from input tokens only
-        q = self.c_attn_q(x)
-
-        # prepend memory tokens to input for key/value computation
-        if self.n_kc > 0:
-            memory = self.memory_tokens.expand(B, -1, -1)
-            kv_input = torch.cat([memory, x], dim=1)
-        else:
-            kv_input = x
-
-        # calculate key, value for all heads in batch
-        S = T + self.n_kc  # total key/value sequence length
-        k, v = self.c_attn_kv(kv_input).split(self.n_embd, dim=2)
-
-        k = k.view(B, S, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, S, hs)
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, S, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, S, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        # causal self-attention; (B, nh, T, hs) x (B, nh, hs, S) -> (B, nh, T, S)
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:, :, :T, :S] == 0, float('-inf'))
+
+        # slice precomputed causal positional heads to current sequence length
+        pos = self.pos_heads[:, :, :T, :T].expand(B, 4, T, T)  # (B, 4, T, T)
+
+        # concatenate handcrafted heads to attention logits -> (B, nh+4, T, T)
+        att_cat = torch.cat([att, pos], dim=1)  # (B, n_att, T, T)
+
+        # apply the attention-MLP across the head dimension: move head dim to last
+        att_perm = att_cat.permute(0, 2, 3, 1)  # (B, T, T, n_att)
+        att_mlp = self.mlp_attf(att_perm)       # (B, T, T, nh)
+        att = att_mlp.permute(0, 3, 1, 2)        # (B, nh, T, T)
+
+        # mask, softmax, dropout
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
-        y = att @ v # (B, nh, T, S) x (B, nh, S, hs) -> (B, nh, T, hs)
+        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
@@ -107,9 +132,10 @@ class Block(nn.Module):
             act     = NewGELU(),
             dropout = nn.Dropout(config.resid_pdrop),
         ))
+
         m = self.mlp
         self.mlpf = lambda x: m.dropout(m.c_proj(m.act(m.c_fc(x)))) # MLP forward
-
+        
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlpf(self.ln_2(x))
@@ -204,7 +230,7 @@ class GPT(nn.Module):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         from transformers import GPT2LMHeadModel
 
-        # create a from-scratch initialized mingpt_memory model
+        # create a from-scratch initialized minGPT model
         config = cls.get_default_config()
         config.model_type = model_type
         config.vocab_size = 50257 # openai's model vocabulary
@@ -264,9 +290,6 @@ class GPT(nn.Module):
                 elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
                     # weights of blacklist modules will NOT be weight decayed
                     no_decay.add(fpn)
-                elif pn == 'memory_tokens':
-                    # learnable memory tokens are not weight decayed
-                    no_decay.add(fpn)
 
         # validate that we considered every parameter
         param_dict = {pn: p for pn, p in self.named_parameters()}
@@ -292,8 +315,9 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        # pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
+
+        x = self.transformer.drop(tok_emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
